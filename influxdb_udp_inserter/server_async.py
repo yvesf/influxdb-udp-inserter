@@ -10,22 +10,45 @@ import aiohttp
 
 class UdpInserterProtocol(asyncio.DatagramProtocol):
     def __init__(self, factory: SerializerFactory, influx_url: str):
-        self.factory = factory
-        self.influx_url = influx_url
-        self.transport: asyncio.Transport = None
+        self._factory = factory
+        self._influx_url = influx_url
+        self._transport: asyncio.Transport = None
+        self._max_delta_t = 10
+        self._known_nonces = {}  # key: timestamp, values: set( (identifier, nonce) )
 
     def connection_made(self, transport):
-        self.transport = transport
+        self._transport = transport
 
-    def datagram_received(self, data, addr):
-        logging.info('Received %s bytes: %r(...) from %s', len(data), data[0:3], addr)
-        if len(data) < 7: return
+    def cleanup_known_nonces(self):
+        now = self._factory.timesource.unix_time_sec()
+        delete = []
+        for key in self._known_nonces.keys():
+            if key < now - self._max_delta_t:
+                delete.append(key)
+        for key in delete:
+            del self._known_nonces[key]
 
-        serializer = self.factory.get_serializer(data[0:3])
-        mesg = serializer.deserialize(data)
+    def datagram_received(self, raw_data, addr):
+        logging.info('Received %s bytes: %r(...) from %s', len(raw_data), raw_data[0:3], addr)
+        if len(raw_data) < 7: return
+
+        identifier = raw_data[0:3]
+        serializer = self._factory.get_serializer(identifier)
+
+        mesg, fields = serializer.deserialize(raw_data, self._max_delta_t)
+
+        # Verify nonce is not known for that timestamp
+        if mesg.timestamp in self._known_nonces.keys() and \
+                mesg.nonce in self._known_nonces[mesg.timestamp]:
+            raise Exception('Possible replay attack: Nonce {} already knwon for timestamp {}'.format(
+                mesg.nonce, mesg.timestamp))
+        else:
+            if not mesg.timestamp in self._known_nonces.keys():
+                self._known_nonces[mesg.timestamp] = set()
+            self._known_nonces[mesg.timestamp].add(mesg.nonce)
 
         influxdb_points = []
-        for key, value in mesg.items():
+        for key, value in fields.items():
             influxdb_points.append({
                 'measurement': key,
                 'tags': {},
@@ -34,7 +57,9 @@ class UdpInserterProtocol(asyncio.DatagramProtocol):
 
         post_data = line_protocol.make_lines({'points': influxdb_points}).encode()
 
-        asyncio.ensure_future(send(self.influx_url + '?db=' + serializer.database, post_data))
+        asyncio.ensure_future(send(self._influx_url + '?db=' + serializer.database, post_data))
+
+        self.cleanup_known_nonces()
 
 
 async def send(url, data):
